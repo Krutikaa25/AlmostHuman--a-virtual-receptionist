@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+backend/vosk-model-en-us-0.22/
+backend/temp.wav
+piper_models/
