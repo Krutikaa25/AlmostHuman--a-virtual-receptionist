@@ -1,35 +1,41 @@
-import wave
-import json
 import os
+import json
+import asyncio
 from vosk import Model, KaldiRecognizer
 from brain_state import set_state, BrainState
 
 
-# ALWAYS resolve absolute path
+# Absolute model path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "vosk-model-en-in-0.5")
-
 
 print("🔍 Loading Vosk model from:", MODEL_PATH)
 
 model = Model(MODEL_PATH)
+recognizer = KaldiRecognizer(model, 16000)
 
 
-def transcribe_file(wav_path: str) -> str:
-    set_state(BrainState.LISTENING) 
-    
-    wf = wave.open(wav_path, "rb")
 
-    recognizer = KaldiRecognizer(model, wf.getframerate())
-    recognizer.SetWords(True)
+def blocking_transcribe(data):
+    global recognizer
 
-    while True:
-        data = wf.readframes(4000)
-        if len(data) == 0:
-            break
-        recognizer.AcceptWaveform(data)
+    if recognizer.AcceptWaveform(data):
+        result = json.loads(recognizer.Result())
+        text = result.get("text", "").strip().lower()
 
-    result = json.loads(recognizer.FinalResult())
+        if text:
+            print("🎤 FINAL:", text)
+            recognizer = KaldiRecognizer(model, 16000)
+            return text
 
-    set_state(BrainState.THINKING) 
-    return result.get("text", "")
+    return None
+
+
+
+
+
+
+async def process_audio(data):
+    loop = asyncio.get_running_loop()
+    text = await loop.run_in_executor(None, blocking_transcribe, data)
+    return text

@@ -1,15 +1,6 @@
 from speak import speak
 from think_with_ollama import think
-
-current_state = "idle"
-
-def set_state(state):
-    global current_state
-    print(f"🧠 STATE → {state}")
-    current_state = state
-
-def get_state():
-    return current_state
+from brain_state import set_state, BrainState
 
 
 def detect_emotion(text: str) -> str:
@@ -23,24 +14,30 @@ def detect_emotion(text: str) -> str:
 
     return "neutral"
 
-def process_user_text(user_text: str) -> dict:
+async def process_user_text(user_text: str) -> dict:
+
     # 🧠 THINKING
-    set_state("thinking")
-    response_text = think(user_text)
+    set_state(BrainState.THINKING)
+    response_text =await think(user_text)
 
     emotion = detect_emotion(response_text)
 
     # 🗣️ SPEAKING
-    set_state("speaking")
-    speak(response_text)
+    set_state(BrainState.SPEAKING)
+    import asyncio
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, speak, response_text)
 
     # 😌 BACK TO IDLE
-    set_state("idle")
+    set_state(BrainState.IDLE)
+
+    import time
 
     return {
         "text": response_text,
         "emotion": emotion,
-        "state": get_state(),
-        "audio_url": "http://localhost:8000/audio"
+        "state": set_state().value,
+        "audio_url": f"http://localhost:8000/static/output.wav?t={int(time.time())}"
+
     }
 
