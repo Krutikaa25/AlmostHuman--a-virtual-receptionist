@@ -4,27 +4,37 @@ import { VRMLoaderPlugin, VRMUtils } from "https://cdn.jsdelivr.net/npm/@pixiv/t
 import { io } from "https://cdn.socket.io/4.7.2/socket.io.esm.min.js";
 
 /* ================= SOCKET ================= */
-const socket = io("http://localhost:8000");
+const socket = io("http://localhost:8000", {
+  transports: ["websocket"]
+});
 
-/* ================= GLOBAL AUDIO CONTEXT ================= */
+/* ================= GLOBAL STATE ================= */
+let currentState = "idle";
+let currentEmotion = "neutral";
+
+/* ================= AUDIO ================= */
 let audioContext = new (window.AudioContext || window.webkitAudioContext)();
-let audio = null;
-let analyser = null;
-let mouthOpen = 0;
-
-function applyEmotion(emotion) {
-  currentEmotion = emotion;
-  console.log("Emotion:", emotion);
-}
-
-/* ================= MIC STREAMING ================= */
 let audioInputContext;
 let processor;
-let lastSendTime = 0;
+let analyser;
+let audio;
+let mouthOpen = 0;
+
+let speaking = false;
+let silenceTimer = null;
+
+/* ================= SOCKET EVENTS ================= */
+
+socket.on("ai_response", (data) => {
+  currentState = data.state;
+  currentEmotion = data.emotion;
+  playAudio(data.audio_url);
+});
+
+/* =================== START MIC ================= */
 
 async function startMic() {
 
-  // 🔥 UPDATED MIC SETTINGS
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
@@ -33,31 +43,100 @@ async function startMic() {
     }
   });
 
-  audioInputContext = new (window.AudioContext || window.webkitAudioContext)({
-    sampleRate: 16000
-  });
+  audioInputContext = new (window.AudioContext || window.webkitAudioContext)();
+  await audioInputContext.resume();
+
+  console.log("Mic sample rate:", audioInputContext.sampleRate);
 
   const source = audioInputContext.createMediaStreamSource(stream);
-
   processor = audioInputContext.createScriptProcessor(4096, 1, 1);
 
+  // 🔥 silent gain node (no speaker loop)
+  const gainNode = audioInputContext.createGain();
+  gainNode.gain.value = 0;
+
   source.connect(processor);
-  processor.connect(audioInputContext.destination);
+  processor.connect(gainNode);
+  gainNode.connect(audioInputContext.destination);
 
   processor.onaudioprocess = (event) => {
-    const now = Date.now();
 
-    if (now - lastSendTime < 50) return; // 🔥 reduced from 100ms to 50ms
-    lastSendTime = now;
+    if (currentState !== "idle") return;
 
     const inputData = event.inputBuffer.getChannelData(0);
-    const pcmData = convertFloatToInt16(inputData);
 
-    socket.emit("audio_chunk", pcmData);
+    // Volume detection
+    let volume = 0;
+    for (let i = 0; i < inputData.length; i++) {
+      volume += Math.abs(inputData[i]);
+    }
+    volume /= inputData.length;
+
+    const downsampled = downsampleBuffer(
+      inputData,
+      audioInputContext.sampleRate,
+      16000
+    );
+
+    const pcmData = convertFloatToInt16(downsampled);
+
+    // Speech detected
+    if (volume > 0.02) {
+      speaking = true;
+      socket.emit("audio_chunk", pcmData);
+
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
+
+    } else if (speaking) {
+      // Send silence frames so Vosk can finalize
+      socket.emit("audio_chunk", pcmData);
+
+      if (!silenceTimer) {
+        silenceTimer = setTimeout(() => {
+          speaking = false;
+          silenceTimer = null;
+          console.log("🛑 Speech ended");
+        }, 1200);
+      }
+    }
   };
 }
 
-// Helper function
+/* ================= DOWNSAMPLE ================= */
+
+function downsampleBuffer(buffer, inputRate, outputRate) {
+  if (outputRate === inputRate) return buffer;
+
+  const ratio = inputRate / outputRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i];
+      count++;
+    }
+
+    result[offsetResult] = accum / count;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+
+  return result;
+}
+
+/* ================= PCM ================= */
+
 function convertFloatToInt16(buffer) {
   const l = buffer.length;
   const buf = new Int16Array(l);
@@ -70,150 +149,10 @@ function convertFloatToInt16(buffer) {
   return buf.buffer;
 }
 
-/* ================= HANDLE SOCKET EVENTS ================= */
-
-socket.on("partial_text", (text) => {
-  console.log("Partial:", text);
-});
-
-socket.on("ai_response", (data) => {
-  applyEmotion(data.emotion);
-  playAudio(data.audio_url);
-});
-
-socket.on("stop_audio", () => {
-  if (audio) {
-    audio.pause();
-    audio.currentTime = 0;
-  }
-  currentState = "idle";
-});
-
-/* ================= START SYSTEM ON CLICK ================= */
-
-let systemStarted = false;
-
-window.addEventListener("click", async () => {
-  if (!systemStarted) {
-    if (audioContext.state === "suspended") {
-      await audioContext.resume();
-    }
-    startMic();
-    systemStarted = true;
-    console.log("🚀 Streaming mic started");
-  }
-});
-
-/* ================= SCENE ================= */
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x000000);
-
-/* ================= CAMERA ================= */
-
-const camera = new THREE.PerspectiveCamera(
-  30,
-  window.innerWidth / window.innerHeight,
-  0.1,
-  100
-);
-
-camera.position.set(0, 1.5, 2.2);
-camera.lookAt(0, 1.45, 0);
-
-/* ================= RENDERER ================= */
-
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(window.devicePixelRatio);
-document.body.appendChild(renderer.domElement);
-
-/* ================= LIGHTING ================= */
-
-scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-
-const keyLight = new THREE.DirectionalLight(0xffffff, 0.8);
-keyLight.position.set(1, 3, 3);
-scene.add(keyLight);
-
-const fillLight = new THREE.PointLight(0xffffff, 0.6);
-fillLight.position.set(-1, 1.5, 2);
-scene.add(fillLight);
-
-/* ================= GLOBAL STATE ================= */
-
-let vrm;
-let currentState = "idle";
-let currentEmotion = "neutral";
-
-/* ================= LOAD AVATAR ================= */
-
-const loader = new GLTFLoader();
-loader.register(parser => new VRMLoaderPlugin(parser));
-
-loader.load("./armholo1.vrm", gltf => {
-  vrm = gltf.userData.vrm;
-  VRMUtils.removeUnnecessaryJoints(vrm.scene);
-  scene.add(vrm.scene);
-  vrm.scene.rotation.y = Math.PI;
-  console.log("✅ VRM loaded");
-});
-
-/* ================= ANIMATION LOOP ================= */
-
-const clock = new THREE.Clock();
-
-function animate() {
-  requestAnimationFrame(animate);
-  const t = clock.elapsedTime;
-  const delta = clock.getDelta();
-
-  if (vrm) {
-    vrm.update(delta);
-    const head = vrm.humanoid.getNormalizedBoneNode("head");
-
-    if (currentState === "idle") {
-      vrm.scene.position.y = Math.sin(t * 1.2) * 0.015;
-      if (head) {
-        head.rotation.y = Math.sin(t * 0.6) * 0.1;
-        head.rotation.x = Math.sin(t * 0.8) * 0.05;
-      }
-    }
-
-    if (currentState === "speaking") {
-      vrm.scene.position.y = Math.sin(t * 4) * 0.02;
-      if (head) {
-        head.rotation.x = Math.sin(t * 8) * 0.12;
-        head.rotation.y = Math.sin(t * 4) * 0.05;
-      }
-    }
-
-    if (analyser) {
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      analyser.getByteFrequencyData(dataArray);
-      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length / 255;
-      mouthOpen = Math.min(avg * 3, 1);
-
-      vrm.expressionManager?.setValue("aa", mouthOpen);
-      vrm.expressionManager?.setValue("ih", mouthOpen * 0.5);
-      vrm.expressionManager?.setValue("ou", mouthOpen * 0.4);
-    }
-
-    if (vrm.expressionManager) {
-      vrm.expressionManager.setValue("happy", currentEmotion === "happy" ? 0.4 : 0);
-      vrm.expressionManager.setValue("angry", currentEmotion === "angry" ? 0.4 : 0);
-      vrm.expressionManager.setValue("sad", currentEmotion === "sad" ? 0.4 : 0);
-    }
-  }
-
-  renderer.render(scene, camera);
-}
-
-animate();
-
-/* ================= AUDIO PLAYBACK ================= */
+/* ================= PLAY AUDIO ================= */
 
 async function playAudio(url) {
+
   if (audio) {
     audio.pause();
     audio = null;
@@ -244,10 +183,92 @@ async function playAudio(url) {
   audio.play().catch(err => console.error(err));
 }
 
-/* ================= RESIZE ================= */
+/* ================= THREE SCENE ================= */
 
-window.addEventListener("resize", () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(
+  30,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  100
+);
+
+camera.position.set(0, 1.5, 2.2);
+camera.lookAt(0, 1.45, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+const keyLight = new THREE.DirectionalLight(0xffffff, 0.8);
+keyLight.position.set(1, 3, 3);
+scene.add(keyLight);
+
+const fillLight = new THREE.PointLight(0xffffff, 0.6);
+fillLight.position.set(-1, 1.5, 2);
+scene.add(fillLight);
+
+let vrm;
+
+const loader = new GLTFLoader();
+loader.register(parser => new VRMLoaderPlugin(parser));
+
+loader.load("./armholo1.vrm", gltf => {
+  vrm = gltf.userData.vrm;
+  VRMUtils.removeUnnecessaryJoints(vrm.scene);
+  scene.add(vrm.scene);
+  vrm.scene.rotation.y = Math.PI;
+});
+
+/* ================= ANIMATION ================= */
+
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+  const t = clock.elapsedTime;
+
+  if (vrm) {
+    vrm.update(delta);
+
+    if (currentState === "idle") {
+      vrm.scene.position.y = Math.sin(t * 1.2) * 0.015;
+    }
+
+    if (currentState === "speaking") {
+      vrm.scene.position.y = Math.sin(t * 4) * 0.02;
+    }
+
+    if (analyser) {
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(dataArray);
+      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length / 255;
+      mouthOpen = Math.min(avg * 3, 1);
+      vrm.expressionManager?.setValue("aa", mouthOpen);
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+
+animate();
+
+/* ================= START SYSTEM ================= */
+
+let started = false;
+
+window.addEventListener("click", async () => {
+  if (!started) {
+    await audioContext.resume();
+    startMic();
+    started = true;
+    console.log("🚀 System started");
+  }
 });
