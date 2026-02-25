@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from brain_state import get_state,BrainState
 
 
-# Async Socket.IO server
+# Async Socket.IO server.
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 app = FastAPI()
 
